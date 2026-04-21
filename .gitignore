@@ -1,0 +1,5 @@
+.env
+api_key.env
+whooutside.db
+__pycache__/
+*.pyc
