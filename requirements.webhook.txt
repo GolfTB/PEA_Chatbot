@@ -1,4 +1,0 @@
-Flask>=2.3,<3.1
-line-bot-sdk>=2.4,<3.0
-paho-mqtt>=1.6,<2.0
-python-dotenv>=1.0,<2.0

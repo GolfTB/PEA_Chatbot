@@ -70,7 +70,6 @@ def post_response(
     employee_id: str = "UNKNOWN",
     line_uuid: str = "",
     source_type: str = "",
-    source_id: str = "",
 ) -> None:
     token_prefix = f"{reply_token[:8]}..." if reply_token else "(empty)"
     print(
@@ -95,7 +94,6 @@ def post_response(
                     "employee_id": employee_id,
                     "line_uuid": line_uuid,
                     "source_type": source_type,
-                    "source_id": source_id,
                 }
             },
         }
@@ -187,14 +185,12 @@ def gethooked(raw_payload: str):
         employee_id = str(msg_content.get("employee_id", "UNKNOWN")).strip() or "UNKNOWN"
         line_uuid = str(msg_content.get("line_uuid", "")).strip()
         source_type = str(msg_content.get("source_type", "")).strip().lower()
-        source_id = str(msg_content.get("source_id", "")).strip()
     else:
         reply_token = ""
         user_text = str(msg_content).strip()
         employee_id = "UNKNOWN"
         line_uuid = ""
         source_type = ""
-        source_id = ""
 
     if not user_text:
         print("[WARNING] Empty user message")
@@ -209,7 +205,6 @@ def gethooked(raw_payload: str):
             employee_id=employee_id,
             line_uuid=line_uuid,
             source_type=source_type,
-            source_id=source_id,
         )
         return False
 
@@ -243,7 +238,6 @@ def gethooked(raw_payload: str):
             employee_id=employee_id,
             line_uuid=line_uuid,
             source_type=source_type,
-            source_id=source_id,
         )
 
         elapsed = time.time() - started
@@ -257,7 +251,6 @@ def gethooked(raw_payload: str):
             employee_id=employee_id,
             line_uuid=line_uuid,
             source_type=source_type,
-            source_id=source_id,
         )
         return False
 

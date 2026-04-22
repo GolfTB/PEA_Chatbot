@@ -116,8 +116,6 @@ class LineRegister:
             reply_token = str(msg_content.get("rep", "")).strip()
             response_text = str(msg_content.get("res", "")).strip()
             line_uuid = str(msg_content.get("line_uuid", "")).strip()
-            source_type = str(msg_content.get("source_type", "")).strip().lower()
-            source_id = str(msg_content.get("source_id", "")).strip()
 
             if not reply_token or not response_text:
                 print(f"[MQTT-IN] skip missing rep/res token={'yes' if reply_token else 'no'} res={'yes' if response_text else 'no'}")
@@ -143,29 +141,6 @@ class LineRegister:
                     token_prefix,
                     exc,
                 )
-                if str(status_code) == "400" and source_id:
-                    try:
-                        self.line_bot_api.push_message(source_id, TextSendMessage(text=response_text))
-                        print(
-                            f"[MQTT-IN] fallback push success source_type={source_type or 'unknown'} "
-                            f"source_id={source_id[:8]}..."
-                        )
-                        self.app.logger.info(
-                            "Fallback push_message success source_type=%s source_id=%s",
-                            source_type or "unknown",
-                            source_id[:8] + "...",
-                        )
-                    except LineBotApiError as push_exc:
-                        push_status = getattr(push_exc, "status_code", "unknown")
-                        print(f"[MQTT-IN] fallback push failed status={push_status} error={push_exc}")
-                        self.app.logger.error(
-                            "Fallback push_message failed status=%s error=%s",
-                            push_status,
-                            push_exc,
-                        )
-                elif str(status_code) == "400" and not source_id:
-                    print("[MQTT-IN] fallback push skipped: missing source_id")
-                    self.app.logger.warning("Fallback push_message skipped because source_id is missing")
         except Exception as exc:
             print(f"[MQTT-IN] handler exception: {exc}")
             self.app.logger.error("Failed to process MQTT reply message: %s", exc)
@@ -395,11 +370,6 @@ class LineRegister:
         line_uuid = event.source.user_id
         user_message = event.message.text.strip()
         source_type = getattr(event.source, "type", "user")
-        source_id = (
-            getattr(event.source, "group_id", None)
-            or getattr(event.source, "room_id", None)
-            or getattr(event.source, "user_id", "")
-        )
 
         if source_type in {"group", "room"} and not self._is_bot_mentioned(event):
             self.app.logger.info("Skip message in %s: bot not mentioned", source_type)
@@ -424,7 +394,6 @@ class LineRegister:
                         "line_uuid": line_uuid,
                         "employee_id": existing_employee["user_id"],
                         "source_type": source_type,
-                        "source_id": source_id,
                     }
                 },
             }
