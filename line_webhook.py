@@ -1,7 +1,34 @@
-from flask import Flask, request, abort
+"""
+สรุปสิ่งที่เปลี่ยน:
+
+1. เพิ่ม env var ใหม่ — TIMESHEET_API_URL (default: http://localhost:5002) ใน .env เพื่อกำหนด URL ของ timesheet service
+
+2. เพิ่ม 2 method ใหม่:
+
+_is_timesheet_command() — ตรวจว่าข้อความ (หลังตัด mention) ขึ้นต้นด้วย Timesheet หรือไม่ (case-insensitive)
+_handle_timesheet_command() — call POST /line_timesheet_command ของ timesheet API พร้อมส่ง source_id (group/room/user id) และ source_type ไปด้วย แล้ว reply ผลกลับ
+3. แก้ handle_text_message() — ดักคำสั่ง Timesheet ก่อนส่งไป AI ถ้า match → เรียก _handle_timesheet_command() แล้ว return เลย ไม่ถึง MQTT
+
+4. อัพเดต join message — เพิ่มคำอธิบายวิธีใช้ Timesheet ใน welcome message
+
+วิธีใช้งาน:
+
+@BotName Timesheet          → ส่งรายงานวันล่าสุด
+@BotName Timesheet 210426   → ส่งรายงานวันที่ 21 เม.ย. 69
+เพิ่มใน .env (ถ้า timesheet รันคนละ host):
+
+env
+TIMESHEET_API_URL=http://localhost:5002
+
+Line webhook
+PY 
+
+"""
+
+from flask import Flask, request, abort, Response
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEvent, JoinEvent
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageSendMessage, FollowEvent, JoinEvent
 import sqlite3
 import os
 import sys
@@ -9,6 +36,7 @@ import json
 import time
 import re
 import threading
+import requests as http_requests
 from dotenv import load_dotenv
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +68,7 @@ class LineRegister:
         self.mqtt_reply_topic = (os.environ.get("MQTT_REPLY_TOPIC", "ai_timesheet_reply") or "ai_timesheet_reply").strip().strip(",")
         self.mqtt_reply_to = (os.environ.get("MQTT_REPLY_TO", "line_webhook") or "line_webhook").strip().strip(",")
         self.bot_user_id = (os.environ.get("LINE_BOT_USER_ID") or "").strip()
+        self.timesheet_api_url = (os.environ.get("TIMESHEET_API_URL", "http://localhost:5002") or "http://localhost:5002").rstrip("/")
 
         if not self.channel_access_token or not self.channel_secret:
             raise RuntimeError("กรุณาตั้งค่า LINE_CHANNEL_ACCESS_TOKEN และ LINE_CHANNEL_SECRET ในไฟล์ .env")
@@ -116,29 +145,66 @@ class LineRegister:
             reply_token = str(msg_content.get("rep", "")).strip()
             response_text = str(msg_content.get("res", "")).strip()
             line_uuid = str(msg_content.get("line_uuid", "")).strip()
+            message_type = str(msg_content.get("type", "text")).strip().lower() or "text"
+            source_id = str(msg_content.get("source_id", "")).strip()
+            image_url = str(msg_content.get("image_url", "")).strip()
+            preview_image_url = str(msg_content.get("preview_image_url", "")).strip() or image_url
 
-            if not reply_token or not response_text:
-                print(f"[MQTT-IN] skip missing rep/res token={'yes' if reply_token else 'no'} res={'yes' if response_text else 'no'}")
-                self.app.logger.warning("Skip MQTT reply payload: missing rep/res")
+            outbound_messages = []
+            if response_text:
+                outbound_messages.append(TextSendMessage(text=response_text))
+
+            if message_type == "image":
+                if not image_url:
+                    print("[MQTT-IN] skip image message: missing image_url")
+                    self.app.logger.warning("Skip MQTT image payload: missing image_url")
+                    return
+                outbound_messages.append(
+                    ImageSendMessage(
+                        original_content_url=image_url,
+                        preview_image_url=preview_image_url,
+                    )
+                )
+
+            if not outbound_messages:
+                print("[MQTT-IN] skip payload: no outbound messages")
+                self.app.logger.warning("Skip MQTT payload: no outbound messages")
                 return
 
-            token_prefix = f"{reply_token[:8]}..."
-            print(f"[MQTT-IN] reply -> LINE token={token_prefix} chars={len(response_text)}")
             try:
-                self.line_bot_api.reply_message(reply_token, TextSendMessage(text=response_text))
-                print(f"[MQTT-IN] LINE reply success token={token_prefix}")
-                self.app.logger.info(
-                    "Forwarded AI reply to LINE via MQTT topic=%s token=%s",
-                    self.mqtt_reply_topic,
-                    token_prefix,
-                )
+                if reply_token:
+                    token_prefix = f"{reply_token[:8]}..."
+                    self.line_bot_api.reply_message(
+                        reply_token,
+                        outbound_messages if len(outbound_messages) > 1 else outbound_messages[0],
+                    )
+                    print(f"[MQTT-IN] LINE reply success token={token_prefix}")
+                    self.app.logger.info(
+                        "Forwarded MQTT message to LINE via reply token=%s",
+                        token_prefix,
+                    )
+                elif source_id:
+                    self.line_bot_api.push_message(
+                        source_id,
+                        outbound_messages if len(outbound_messages) > 1 else outbound_messages[0],
+                    )
+                    print(f"[MQTT-IN] LINE push success source_id={source_id}")
+                    self.app.logger.info(
+                        "Forwarded MQTT message to LINE via push source_id=%s",
+                        source_id,
+                    )
+                else:
+                    print("[MQTT-IN] skip payload: missing both reply_token and source_id")
+                    self.app.logger.warning(
+                        "Skip MQTT payload: missing both reply_token and source_id"
+                    )
             except LineBotApiError as exc:
                 status_code = getattr(exc, "status_code", "unknown")
-                print(f"[MQTT-IN] LINE reply failed status={status_code} token={token_prefix} error={exc}")
+                print(f"[MQTT-IN] LINE send failed status={status_code} source_id={source_id} error={exc}")
                 self.app.logger.error(
-                    "LINE reply failed status=%s token=%s error=%s",
+                    "LINE send failed status=%s source_id=%s error=%s",
                     status_code,
-                    token_prefix,
+                    source_id,
                     exc,
                 )
         except Exception as exc:
@@ -173,8 +239,30 @@ class LineRegister:
         self.app.add_url_rule("/webhook", view_func=self.callback, methods=["POST"])
         self.app.add_url_rule("/callback", view_func=self.callback, methods=["POST"])
         self.app.add_url_rule("/webhook-test/line-webhook", view_func=self.callback, methods=["POST"])
+        self.app.add_url_rule("/plotdailylog_image", view_func=self.proxy_plotdailylog_image_latest, methods=["GET"])
+        self.app.add_url_rule("/plotdailylog_image/<sheet_date>", view_func=self.proxy_plotdailylog_image, methods=["GET"])
         self.app.add_url_rule("/", view_func=self.health_check, methods=["GET"])
         self.app.add_url_rule("/healthz", view_func=self.health_check, methods=["GET"])
+
+    def _proxy_timesheet_image(self, sheet_date: str | None = None):
+        target = f"{self.timesheet_api_url}/plotdailylog_image"
+        if sheet_date:
+            target = f"{target}/{sheet_date}"
+
+        try:
+            resp = http_requests.get(target, timeout=60)
+        except Exception as exc:
+            self.app.logger.error("Timesheet image proxy failed target=%s error=%s", target, exc)
+            return Response("Timesheet service unavailable", status=502, mimetype="text/plain")
+
+        content_type = resp.headers.get("Content-Type", "application/octet-stream")
+        return Response(resp.content, status=resp.status_code, mimetype=content_type)
+
+    def proxy_plotdailylog_image_latest(self):
+        return self._proxy_timesheet_image(None)
+
+    def proxy_plotdailylog_image(self, sheet_date):
+        return self._proxy_timesheet_image((sheet_date or "").strip())
 
     def _register_handlers(self):
         # self.webhook_handler.add(FollowEvent)(self.handle_follow)
@@ -195,26 +283,34 @@ class LineRegister:
         }
 
     def get_employee_by_id(self, user_id: str):
-        conn = sqlite3.connect(self.db_file)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT user_id, fullname, position, dept, enabled, line_uuid FROM employees WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        return self._row_to_employee(row)
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT user_id, fullname, position, dept, enabled, line_uuid FROM employees WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            conn.close()
+            return self._row_to_employee(row)
+        except sqlite3.OperationalError as exc:
+            self.app.logger.error("Employee DB query failed (by id): %s", exc)
+            return None
 
     def get_employee_by_line_uuid(self, line_uuid: str):
-        conn = sqlite3.connect(self.db_file)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT user_id, fullname, position, dept, enabled, line_uuid FROM employees WHERE line_uuid = ?",
-            (line_uuid,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        return self._row_to_employee(row)
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT user_id, fullname, position, dept, enabled, line_uuid FROM employees WHERE line_uuid = ?",
+                (line_uuid,),
+            )
+            row = cur.fetchone()
+            conn.close()
+            return self._row_to_employee(row)
+        except sqlite3.OperationalError as exc:
+            self.app.logger.error("Employee DB query failed (by line uuid): %s", exc)
+            return None
 
     def update_line_uuid(self, user_id: str, line_uuid: str):
         conn = sqlite3.connect(self.db_file)
@@ -358,6 +454,9 @@ class LineRegister:
             "สวัสดีครับ! ขอบคุณที่เชิญผู้ช่วยฝ่ายบุคคลเข้ามาในกลุ่ม\n\n"
             "📌 วิธีใช้งาน:\n"
             "พิมพ์ @ชื่อบอท ตามด้วยข้อความ เช่น '@bot พรุ่งนี้ขอลากิจ 1 วัน'\n\n"
+            "📊 ดูรายงาน Timesheet:\n"
+            "@ชื่อบอท Timesheet — ส่งรายงานวันล่าสุด\n"
+            "@ชื่อบอท Timesheet DDMMYY — ส่งรายงานวันที่ระบุ เช่น Timesheet 210426\n\n"
             "⚠️ สำหรับพนักงานที่ยังไม่เคยลงทะเบียน ให้ @ชื่อบอท แล้วพิมพ์ 'รหัสพนักงาน' ของคุณในกลุ่มนี้ก่อนนะครับ"
         )
         self.line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
@@ -373,6 +472,11 @@ class LineRegister:
 
         if source_type in {"group", "room"} and not self._is_bot_mentioned(event):
             self.app.logger.info("Skip message in %s: bot not mentioned", source_type)
+            return
+
+        # ── คำสั่ง Timesheet ต้องทำงานได้แม้ฐานข้อมูลพนักงานยังไม่พร้อม ──
+        if self._is_timesheet_command(event, user_message):
+            self._handle_timesheet_command(event, user_message, source_type)
             return
 
         existing_employee = self.get_employee_by_line_uuid(line_uuid)
@@ -429,6 +533,78 @@ class LineRegister:
 
         self.line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
+    def _is_timesheet_command(self, event, user_message: str) -> bool:
+        """ตรวจสอบว่าข้อความ (หลังตัด mention) ขึ้นต้นด้วย 'timesheet' หรือไม่"""
+        text = user_message.strip()
+        # ตัด mention token นำหน้า เช่น @BotName
+        text = re.sub(r'^@\S+\s+', '', text).strip()
+        parts = text.split()
+        return bool(parts) and parts[0].lower() == 'timesheet'
+ 
+    def _handle_timesheet_command(self, event, user_message: str, source_type: str):
+        """ส่งคำสั่ง Timesheet ไปยัง timesheet API แล้ว reply สถานะกลับ"""
+        # ดึง source_id ของกลุ่ม/ห้อง/ผู้ใช้
+        source = event.source
+        if source_type == 'group':
+            source_id = getattr(source, 'group_id', '') or ''
+        elif source_type == 'room':
+            source_id = getattr(source, 'room_id', '') or ''
+        else:
+            source_id = getattr(source, 'user_id', '') or ''
+ 
+        # ตัด mention token นำหน้าออกก่อนส่ง
+        text = re.sub(r'^@\S+\s+', '', user_message.strip()).strip()
+ 
+        try:
+            resp = http_requests.post(
+                f"{self.timesheet_api_url}/line_timesheet_command",
+                json={
+                    "text": text,
+                    "source_id": source_id,
+                    "source_type": source_type,
+                },
+                timeout=30,
+            )
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception as exc:
+            self.app.logger.error("Failed to call timesheet API: %s", exc)
+            self.line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="❌ ไม่สามารถเชื่อมต่อ Timesheet API ได้ กรุณาลองใหม่อีกครั้ง"),
+            )
+            return
+ 
+        handled = data.get("handled", False)
+        error = data.get("error", "")
+        message = data.get("message", "")
+        image_url = str(data.get("image_url", "") or "").strip()
+ 
+        if not handled:
+            # ไม่ใช่คำสั่ง Timesheet (ไม่ควรเกิดขึ้น แต่ป้องกันไว้)
+            return
+ 
+        if error:
+            reply_text = f"❌ {error}"
+        else:
+            reply_text = f"✅ {message}" if message else "✅ กำลังส่งรายงาน Timesheet เข้ากลุ่ม..."
+
+        reply_messages = [TextSendMessage(text=reply_text)]
+        if not error and image_url:
+            reply_messages.append(
+                ImageSendMessage(
+                    original_content_url=image_url,
+                    preview_image_url=image_url,
+                )
+            )
+
+        try:
+            self.line_bot_api.reply_message(
+                event.reply_token,
+                reply_messages if len(reply_messages) > 1 else reply_messages[0],
+            )
+        except Exception as exc:
+            self.app.logger.error("Failed to reply Timesheet result: %s", exc)
+ 
     def health_check(self):
         return "LINE Register is running!"
 

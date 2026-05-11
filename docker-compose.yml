@@ -1,0 +1,20 @@
+services:
+  app_ev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pea_app_ev
+    env_file:
+      - ./.env
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./basic_agent_langchain_tool.py:/app/basic_agent_langchain_tool.py:ro
+      - ../../whooutside.db:/app/whooutside.db
+    command: ["python", "/app/app_ev.py"]
+    restart: unless-stopped
+
+# Notes:
+# - .env is mounted to /app/.env so load_dotenv() can read from file directly.
+# - app_ev receives env vars via env_file (must include MQTT_HOST etc.)
+# - app_ev listens to MQTT (make sure MQTT_HOST in .env points to your broker)
+# - ngrok (if used for webhooks) should run on host and forward to the host port mapped to your webhook service
