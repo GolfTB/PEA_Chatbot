@@ -7,12 +7,12 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Install Python deps from repo-level requirements.txt
-COPY mqtt/PEA_Chatbot/requirements.txt /tmp/requirements.txt
+# Install Python deps
+COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Copy service code but DO NOT include host .env
-COPY mqtt/PEA_Chatbot /app
+# Copy service code
+COPY . /app
 
 ENV PYTHONUNBUFFERED=1
 

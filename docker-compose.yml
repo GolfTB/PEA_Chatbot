@@ -9,7 +9,7 @@ services:
     volumes:
       - ./.env:/app/.env:ro
       - ./basic_agent_langchain_tool.py:/app/basic_agent_langchain_tool.py:ro
-      - ../../whooutside.db:/app/whooutside.db
+      - ./whooutside.db:/app/whooutside.db
     command: ["python", "/app/app_ev.py"]
     restart: unless-stopped
 
